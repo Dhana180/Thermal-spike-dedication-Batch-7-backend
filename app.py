@@ -14,9 +14,9 @@ BASE = os.path.dirname(__file__)
 
 # ── Load model artefacts ──────────────────────────────────────────────────────
 def load_models():
-    with open(os.path.join(BASE, "models", "ohe.pkl"),      "rb") as f: ohe_cols      = pickle.load(f)
-    with open(os.path.join(BASE, "models", "scaler.pkl"),   "rb") as f: all_feat_cols = pickle.load(f)
-    with open(os.path.join(BASE, "models", "Xgboost.pkl"),  "rb") as f: model         = pickle.load(f)
+    with open(os.path.join(BASE, "models", "ohe.pkl"),     "rb") as f: ohe_cols      = pickle.load(f)
+    with open(os.path.join(BASE, "models", "scaler.pkl"),  "rb") as f: all_feat_cols = pickle.load(f)
+    with open(os.path.join(BASE, "models", "Xgboost.pkl"), "rb") as f: model         = pickle.load(f)
     return ohe_cols, all_feat_cols, model
 
 ohe_cols, all_feat_cols, model = load_models()
@@ -29,29 +29,27 @@ NUMERIC_COLS = [
     "inlet_temp_c","outlet_temp_c","hotspot_temp_c","cooling_capacity_pct",
     "airflow_rate_cfm","ambient_temp_c","humidity_pct","rolling_avg_temp_15m_c",
 ]
-TIME_COLS = ["hour","day_of_week","month","is_weekend"]
+TIME_COLS = ["hour", "day_of_week", "month", "is_weekend"]
 
 def preprocess_input(inp):
-    # Start with all numeric features
     row = {col: float(inp.get(col, 0.0)) for col in NUMERIC_COLS}
 
-    # Initialise every column the model knows about to 0
-    feat_list = list(all_feat_cols)          # ← convert once; may be ndarray / Index
-    for col in feat_list:
+    # Initialise every OHE / scaler column to 0
+    for col in all_feat_cols:
         if col not in row:
             row[col] = 0
 
-    # One-hot encode categorical fields
+    # One-hot: flip the matching column to 1
     for key in [
-        f"ServerID_{inp.get('ServerID','').lower()}",
-        f"UserID_{inp.get('UserID','').lower()}",
-        f"DataCentreZone_{inp.get('DataCentreZone','').lower()}",
-        f"WorkType_{inp.get('WorkType','').lower()}",
+        f"ServerID_{str(inp.get('ServerID', '')).lower()}",
+        f"UserID_{str(inp.get('UserID', '')).lower()}",
+        f"DataCentreZone_{str(inp.get('DataCentreZone', '')).lower()}",
+        f"WorkType_{str(inp.get('WorkType', '')).lower()}",
     ]:
         if key in row:
             row[key] = 1
 
-    # Derive time features from timestamp
+    # Time features – derived from Timestamp
     ts_str = inp.get("Timestamp", str(datetime.datetime.now()))
     try:
         import pandas as pd
@@ -64,18 +62,17 @@ def preprocess_input(inp):
     row["month"]       = int(ts.month)
     row["is_weekend"]  = int(ts.weekday() >= 5)
 
-    # ── FIX: use only feat_list as the column order ──────────────────────────
-    # TIME_COLS are already inside all_feat_cols — do NOT append them again.
-    # Appending caused duplicate columns → wrong feature-matrix width → the
-    # "truth value of an array" error inside XGBoost.
-    return np.array([[row.get(c, 0) for c in feat_list]], dtype=np.float64)
+    # ── TIME_COLS are NOT inside all_feat_cols; append them ──────────────────
+    # all_feat_cols = 5151 columns  +  TIME_COLS = 4  →  5155 (what model expects)
+    ordered = list(all_feat_cols) + TIME_COLS
+    return np.array([[row.get(c, 0) for c in ordered]], dtype=np.float64)
 
 
 def build_causes_solutions(inp, pred, hotspot_temp, cooling_cap, power_draw,
                            airflow, rolling_avg, ambient_temp, work_type,
                            outlet_temp, inlet_temp, gpu_mem):
     causes, solutions = [], []
-    if pred:          # pred is already a plain Python int — safe in bool context
+    if pred:
         if hotspot_temp >= 80:
             causes.append(f"Critical hotspot temperature ({hotspot_temp}°C) — above safe threshold ~80°C")
             solutions.append("Immediately lower workload and activate emergency cooling mode")
@@ -129,14 +126,17 @@ def predict():
 
         X = preprocess_input(data)
 
-        # ── FIX: force scalar Python types to avoid numpy bool ambiguity ──────
-        raw_pred  = model.predict(X)
-        pred      = int(np.array(raw_pred).flatten()[0])   # guaranteed Python int
-        raw_proba = model.predict_proba(X)
-        proba     = np.array(raw_proba).flatten().tolist()  # guaranteed Python list
+        # ── Force plain Python scalars — avoids numpy "truth value" error ────
+        # model.predict()       → ndarray, may be 1-D or 2-D depending on version
+        # model.predict_proba() → always (n_samples, n_classes)
+        pred_raw  = model.predict(X)
+        pred      = int(np.asarray(pred_raw).ravel()[0])          # guaranteed int
 
-        spike_pct  = round(proba[1] * 100, 2)
-        normal_pct = round(proba[0] * 100, 2)
+        proba_raw = model.predict_proba(X)
+        proba     = np.asarray(proba_raw).ravel().tolist()        # guaranteed [p0, p1]
+
+        spike_pct  = round(float(proba[1]) * 100, 2)
+        normal_pct = round(float(proba[0]) * 100, 2)
 
         hotspot_temp = float(data.get("hotspot_temp_c", 0))
         cooling_cap  = float(data.get("cooling_capacity_pct", 100))
@@ -156,27 +156,32 @@ def predict():
         )
 
         return jsonify({
-            "prediction":        pred,
-            "is_spike":          bool(pred),
-            "spike_probability": spike_pct,
-            "normal_probability":normal_pct,
-            "risk_band":         "High" if spike_pct >= 70 else ("Elevated" if spike_pct >= 40 else "Low"),
-            "causes":            causes,
-            "solutions":         solutions,
-            "server_id":         data.get("ServerID",""),
-            "zone":              data.get("DataCentreZone",""),
-            "timestamp":         data.get("Timestamp", str(datetime.datetime.now())),
+            "prediction":         pred,
+            "is_spike":           bool(pred),
+            "spike_probability":  spike_pct,
+            "normal_probability": normal_pct,
+            "risk_band":          "High" if spike_pct >= 70 else ("Elevated" if spike_pct >= 40 else "Low"),
+            "causes":             causes,
+            "solutions":          solutions,
+            "server_id":          data.get("ServerID", ""),
+            "zone":               data.get("DataCentreZone", ""),
+            "timestamp":          data.get("Timestamp", str(datetime.datetime.now())),
         })
 
     except Exception as e:
         import traceback
-        print(traceback.format_exc())          # full trace in Render logs
+        traceback.print_exc()          # full trace visible in Render logs
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "model": "XGBoost Thermal Spike Detector", "version": "1.0.0"})
+    return jsonify({
+        "status": "ok",
+        "model": "XGBoost Thermal Spike Detector",
+        "version": "1.0.0",
+        "expected_features": len(list(all_feat_cols)) + len(TIME_COLS),
+    })
 
 
 if __name__ == "__main__":
